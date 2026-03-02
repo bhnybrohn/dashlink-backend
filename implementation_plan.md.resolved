@@ -1,0 +1,859 @@
+# DashLink Backend — Comprehensive Implementation Plan v2
+
+> **Source**: [DashLink PRD v1.0](file:///Users/tolusmith/Documents/dashlink/DashLink_PRD_v1.pdf)
+> **Stack**: FastAPI (Python 3.12+) · PostgreSQL 16 · Redis 7 · SQLAlchemy 2.0 + Alembic · Celery · Docker
+> **Architecture**: Module-Based (Vertical Slice) Monolith
+
+---
+
+## 1. Architecture Philosophy
+
+### Module-Based (Vertical Slice) Architecture
+
+Every domain concern lives in a **self-contained module**. Each module owns its models, schemas, routes, services, and repository — no cross-module imports of internals. Modules communicate through the **shared core** or **explicit interfaces (protocols)**.
+
+```
+Module = Routes + Schemas + Service + Repository + Models
+```
+
+> [!IMPORTANT]
+> **Why vertical slices, not layers?** In a traditional layered architecture, a single feature change touches files across 4–5 directories. With modules, all related code lives together — easier to reason about, test, refactor, and eventually extract into a microservice.
+
+### CAP Theorem Trade-offs
+
+DashLink is a commerce platform that handles **money and inventory**. We make deliberate CAP trade-offs per subsystem:
+
+| Subsystem | CAP Choice | Rationale |
+|-----------|-----------|-----------|
+| **Payments & Stock** | **CP** (Consistency + Partition tolerance) | Payments and inventory MUST be consistent. We sacrifice availability briefly (retry/queue) rather than risk double-charging or overselling. Atomic DB transactions, Redis distributed locks with fencing tokens, idempotent webhook processing. |
+| **Orders** | **CP** | Order state machine transitions are strictly consistent. Serializable isolation on status updates. Optimistic locking with version columns. |
+| **Analytics & Events** | **AP** (Availability + Partition tolerance) | Analytics can tolerate eventual consistency. Events are fire-and-forget to Redis/Celery, aggregated asynchronously. A few seconds of delay is acceptable. |
+| **Notifications** | **AP** | Notifications are best-effort with retry. A delayed notification is acceptable; a lost payment is not. |
+| **Sessions & Cache** | **AP** | Redis-backed sessions are ephemeral. Loss of a session means re-auth, not data loss. |
+| **User Auth** | **CP** | Credential validation must be consistent. We never serve stale auth state. Token revocation is synchronous against Redis. |
+
+**Implementation patterns:**
+- **CP systems**: Use PostgreSQL transactions with `SERIALIZABLE` or `REPEATABLE READ` isolation, `SELECT ... FOR UPDATE`, and version columns for optimistic concurrency
+- **AP systems**: Use async Celery tasks, Redis pub/sub, eventual consistency with idempotent consumers
+
+### SOLID Principles
+
+| Principle | How We Enforce It |
+|-----------|------------------|
+| **S** — Single Responsibility | Each module's `service.py` handles only its domain logic. Repositories handle only data access. Routes handle only HTTP concerns (validation, auth, response shaping). |
+| **O** — Open/Closed | Payment gateways are added by implementing a `PaymentGateway` Protocol — no modification of existing gateway code. Notification channels follow the same pattern. |
+| **L** — Liskov Substitution | All gateway implementations (Stripe, Paystack, Flutterwave) are interchangeable behind the `PaymentGateway` Protocol. Any can be swapped without changing checkout logic. |
+| **I** — Interface Segregation | Services depend on narrow Protocols, not fat classes. e.g., `StockLocker` Protocol exposes only `lock()`, `unlock()`, `verify()` — not the entire Redis client. |
+| **D** — Dependency Inversion | Services depend on abstractions (Protocols), not concrete implementations. Injected via FastAPI's `Depends()` system. Testing uses mock implementations. |
+
+### DRY Principle Enforcement
+
+| Pattern | Purpose |
+|---------|---------|
+| **`core/` shared module** | Base model classes, common schemas (pagination, error responses), security utilities, encryption — used by all modules. |
+| **Repository base class** | `BaseRepository[T]` with generic CRUD (`create`, `get`, `list`, `update`, `soft_delete`). Each module's repository extends this, adding domain-specific queries only. |
+| **Schema mixins** | `TimestampMixin`, `PaginatedResponse[T]`, `AuditFields` — reusable across all modules. |
+| **Middleware** | Auth, rate limiting, CORS, error handling — applied globally, not duplicated per route. |
+| **Protocol-based integrations** | One `PaymentGateway` Protocol, one `NotificationChannel` Protocol, one `StorageBackend` Protocol — shared contracts, multiple implementations. |
+
+---
+
+## 2. Project Structure (Module-Based)
+
+```
+dashlink-backend/
+├── alembic/                            # Database migrations
+│   ├── versions/
+│   └── env.py
+│
+├── app/
+│   ├── __init__.py
+│   ├── main.py                         # FastAPI app factory, module registration
+│   ├── config.py                       # Pydantic BaseSettings (env vars)
+│   ├── database.py                     # Async engine + session factory
+│   ├── redis.py                        # Redis connection pool
+│   │
+│   ├── core/                           # ── SHARED CORE (cross-cutting) ──
+│   │   ├── __init__.py
+│   │   ├── base_model.py              # SQLAlchemy base: id, created_at, updated_at, deleted_at
+│   │   ├── base_repository.py         # Generic CRUD: BaseRepository[T]
+│   │   ├── base_schemas.py            # PaginatedResponse[T], ErrorResponse, TimestampMixin
+│   │   ├── security.py                # Argon2 hashing, JWT encode/decode
+│   │   ├── encryption.py              # AES-256 field-level encryption
+│   │   ├── slug.py                    # nanoid slug generator
+│   │   ├── permissions.py             # RBAC dependency (role + permission checks)
+│   │   ├── rate_limiter.py            # Redis-backed sliding window
+│   │   ├── pagination.py              # Cursor & offset pagination
+│   │   ├── exceptions.py              # DashLinkError hierarchy
+│   │   ├── middleware.py              # CORS, request ID, error handler, audit logger
+│   │   └── protocols.py              # Shared Protocols: PaymentGateway, NotificationChannel, StorageBackend
+│   │
+│   ├── auth/                           # ── AUTH MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # RefreshToken, LoginAttempt
+│   │   ├── schemas.py                 # RegisterRequest, LoginRequest, TokenResponse, MFASetup
+│   │   ├── service.py                 # Auth logic: register, login, token rotation, MFA, breach check
+│   │   ├── repository.py              # Token persistence, login attempt tracking
+│   │   ├── router.py                  # POST /register, /login, /refresh, /mfa/*, /google
+│   │   └── dependencies.py           # get_current_user, require_seller, require_buyer, require_role
+│   │
+│   ├── users/                          # ── USERS MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # User, Address
+│   │   ├── schemas.py                 # UserResponse, UpdateProfile, AddressCreate
+│   │   ├── service.py                 # Profile CRUD, shadow account merge, GDPR export/delete
+│   │   ├── repository.py              # User queries, address queries
+│   │   └── router.py                  # GET/PATCH /me, addresses CRUD
+│   │
+│   ├── sellers/                        # ── SELLERS MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # SellerProfile, SellerSubscription, TeamMember
+│   │   ├── schemas.py                 # SellerProfileCreate, StoreSettings, SubscriptionTier
+│   │   ├── service.py                 # Profile management, KYC, subscription logic, team RBAC
+│   │   ├── repository.py              # Seller queries
+│   │   └── router.py                  # /seller/profile, /seller/subscription, /seller/team
+│   │
+│   ├── products/                       # ── PRODUCTS MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # Product, ProductImage, ProductVariant
+│   │   ├── schemas.py                 # ProductCreate, ProductUpdate, ImageUpload, VariantCreate
+│   │   ├── service.py                 # CRUD, slug gen, status machine, scheduled publishing, stock ops
+│   │   ├── repository.py              # Product queries, variant queries, image queries
+│   │   └── router.py                  # /products CRUD, /images, /variants, /bulk-upload
+│   │
+│   ├── studio/                         # ── AI STUDIO MODULE ── ✨ NEW
+│   │   ├── __init__.py
+│   │   ├── models.py                  # StudioGeneration (tracks all AI generations)
+│   │   ├── schemas.py                 # CaptionRequest, DescriptionRequest, TitleRequest,
+│   │   │                              #   ImageGenRequest, BackgroundRemoveRequest, StudioUsage
+│   │   ├── service.py                 # Orchestrates all AI generation with usage tracking
+│   │   ├── repository.py              # Generation history, usage counters
+│   │   ├── router.py                  # /studio/* endpoints
+│   │   ├── prompts.py                 # Prompt templates (caption, description, title, image)
+│   │   └── tasks.py                   # Celery tasks for async generation
+│   │
+│   ├── checkout/                       # ── CHECKOUT MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # StockLock
+│   │   ├── schemas.py                 # LockRequest, CheckoutInitiate, CheckoutSession
+│   │   ├── service.py                 # Lock → Order → Payment session orchestration
+│   │   ├── stock_locker.py            # Redis + DB double-write stock locking
+│   │   ├── repository.py              # Lock persistence
+│   │   └── router.py                  # POST /checkout/lock, /checkout/initiate
+│   │
+│   ├── orders/                         # ── ORDERS MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # Order, OrderItem
+│   │   ├── schemas.py                 # OrderResponse, StatusUpdate, BulkStatusUpdate
+│   │   ├── service.py                 # Order lifecycle, status machine, dispute handling
+│   │   ├── repository.py              # Order queries (seller view, buyer view, filtered)
+│   │   └── router.py                  # /orders/seller/*, /orders/buyer/*
+│   │
+│   ├── payments/                       # ── PAYMENTS MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # Payment, Payout
+│   │   ├── schemas.py                 # PaymentResponse, PayoutResponse, WebhookPayload
+│   │   ├── service.py                 # Multi-gateway orchestration, fee calc, payout scheduling
+│   │   ├── repository.py              # Payment/payout queries
+│   │   ├── router.py                  # /webhooks/stripe, /webhooks/paystack, /payouts
+│   │   ├── gateways/                  # Gateway implementations (SOLID: O + L)
+│   │   │   ├── __init__.py
+│   │   │   ├── stripe.py             # StripeGateway(PaymentGateway)
+│   │   │   ├── paystack.py           # PaystackGateway(PaymentGateway)
+│   │   │   └── flutterwave.py        # FlutterwaveGateway(PaymentGateway)
+│   │   └── tasks.py                   # Payout processing (Celery)
+│   │
+│   ├── notifications/                  # ── NOTIFICATIONS MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # Notification, NotificationPreference
+│   │   ├── schemas.py                 # NotificationResponse, PreferenceUpdate
+│   │   ├── service.py                 # Multi-channel dispatch, template rendering
+│   │   ├── repository.py              # Notification queries
+│   │   ├── router.py                  # /notifications, /notifications/preferences
+│   │   ├── channels/                  # Channel implementations (SOLID: O + L)
+│   │   │   ├── __init__.py
+│   │   │   ├── email.py              # EmailChannel(NotificationChannel) — Resend
+│   │   │   ├── sms.py                # SMSChannel(NotificationChannel) — Twilio
+│   │   │   ├── whatsapp.py           # WhatsAppChannel(NotificationChannel) — Twilio
+│   │   │   └── push.py              # PushChannel(NotificationChannel) — Firebase
+│   │   ├── templates/                 # Notification content templates
+│   │   └── tasks.py                   # Async dispatch (Celery)
+│   │
+│   ├── reviews/                        # ── REVIEWS MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # Review
+│   │   ├── schemas.py                 # ReviewCreate, ReviewResponse
+│   │   ├── service.py                 # Submit, moderate, aggregate ratings
+│   │   ├── repository.py              # Review queries
+│   │   └── router.py                  # /reviews
+│   │
+│   ├── analytics/                      # ── ANALYTICS MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # AnalyticsEvent, DailyAggregate
+│   │   ├── schemas.py                 # OverviewResponse, FunnelResponse, TrafficBreakdown
+│   │   ├── service.py                 # Event tracking, aggregation, funnel calculation
+│   │   ├── repository.py              # Event ingestion, aggregate queries
+│   │   ├── router.py                  # /analytics/overview, /funnel, /traffic, /revenue-chart
+│   │   └── tasks.py                   # Hourly aggregation (Celery beat)
+│   │
+│   ├── storefront/                     # ── STOREFRONT MODULE (public) ──
+│   │   ├── __init__.py
+│   │   ├── schemas.py                 # StorefrontResponse, FlashPageResponse
+│   │   ├── service.py                 # Assemble public storefront + flash page data
+│   │   ├── repository.py              # Public product/seller queries
+│   │   └── router.py                  # /@{slug}, /flash/{product_slug}
+│   │
+│   ├── crm/                            # ── CRM MODULE (Phase 3) ──
+│   │   ├── __init__.py
+│   │   ├── schemas.py                 # CustomerProfile, BroadcastRequest
+│   │   ├── service.py                 # Customer segmentation, broadcast orchestration
+│   │   ├── repository.py              # Customer list queries (from orders)
+│   │   └── router.py                  # /crm/customers, /crm/broadcast
+│   │
+│   ├── admin/                          # ── ADMIN MODULE ──
+│   │   ├── __init__.py
+│   │   ├── models.py                  # AuditLog
+│   │   ├── schemas.py                 # AuditLogResponse, ModerationAction
+│   │   ├── service.py                 # Content moderation, dispute mediation, KYC review
+│   │   ├── repository.py              # Audit log queries, flagged content queries
+│   │   └── router.py                  # /admin/*
+│   │
+│   └── integrations/                   # ── EXTERNAL SERVICE ADAPTERS ──
+│       ├── __init__.py
+│       ├── openai_client.py           # OpenAI API (GPT-4o-mini, DALL·E)
+│       ├── removebg_client.py         # Remove.bg API
+│       ├── twilio_client.py           # Twilio (SMS + WhatsApp)
+│       ├── firebase_client.py         # Firebase Cloud Messaging
+│       ├── resend_client.py           # Resend transactional email
+│       └── storage_client.py          # S3/R2 (implements StorageBackend Protocol)
+│
+├── tests/
+│   ├── conftest.py                     # Fixtures: test DB, async client, auth helpers, mock gateways
+│   ├── auth/
+│   │   └── test_auth.py
+│   ├── products/
+│   │   └── test_products.py
+│   ├── studio/
+│   │   └── test_studio.py
+│   ├── checkout/
+│   │   └── test_checkout.py
+│   ├── orders/
+│   │   └── test_orders.py
+│   ├── payments/
+│   │   └── test_webhooks.py
+│   └── analytics/
+│       └── test_analytics.py
+│
+├── docker-compose.yml
+├── Dockerfile
+├── pyproject.toml
+├── alembic.ini
+├── .env.example
+└── .github/workflows/ci.yml
+```
+
+---
+
+## 3. Core Module — Shared Abstractions (DRY)
+
+### 3.1 Base Model (all modules inherit)
+
+```python
+# app/core/base_model.py
+class BaseModel(DeclarativeBase):
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    created_at: Mapped[datetime] = mapped_column(default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(default=func.now(), onupdate=func.now())
+    deleted_at: Mapped[datetime | None] = mapped_column(nullable=True)   # soft delete
+    version: Mapped[int] = mapped_column(default=1)                      # optimistic locking
+```
+
+### 3.2 Base Repository (all repositories inherit)
+
+```python
+# app/core/base_repository.py
+class BaseRepository(Generic[T]):
+    """Generic CRUD — never duplicated across modules."""
+
+    async def create(self, obj: T) -> T: ...
+    async def get(self, id: UUID) -> T | None: ...
+    async def get_or_404(self, id: UUID) -> T: ...
+    async def list(self, filters, pagination) -> PaginatedResult[T]: ...
+    async def update(self, id: UUID, data: dict) -> T: ...
+    async def soft_delete(self, id: UUID) -> None: ...
+```
+
+### 3.3 Protocols (Dependency Inversion)
+
+```python
+# app/core/protocols.py
+class PaymentGateway(Protocol):
+    async def create_session(self, order: OrderData) -> SessionResult: ...
+    async def verify_webhook(self, headers: dict, body: bytes) -> WebhookEvent: ...
+    async def refund(self, payment_ref: str, amount: Decimal) -> RefundResult: ...
+
+class NotificationChannel(Protocol):
+    async def send(self, recipient: str, template: str, context: dict) -> DeliveryResult: ...
+
+class StorageBackend(Protocol):
+    async def upload(self, file: bytes, key: str, content_type: str) -> str: ...
+    async def delete(self, key: str) -> None: ...
+    def get_public_url(self, key: str) -> str: ...
+
+class AIProvider(Protocol):
+    async def generate_text(self, prompt: str, max_tokens: int) -> str: ...
+    async def generate_image(self, prompt: str, size: str) -> bytes: ...
+```
+
+---
+
+## 4. AI Studio Module ✨
+
+The Studio is the seller's **creative workspace** — one unified place to generate product images, titles, descriptions, captions, and remove backgrounds. All generation is tracked, usage-limited by subscription tier, and async via Celery.
+
+### 4.1 `studio_generations` table
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| `id` | UUID | PK | |
+| `seller_id` | UUID | FK → seller_profiles | |
+| `product_id` | UUID | FK → products, nullable | Can generate without a product |
+| `generation_type` | ENUM | NOT NULL | `image`, `title`, `description`, `caption`, `background_removal` |
+| `input_data` | JSONB | NOT NULL | Prompt, product context, image ref |
+| `output_data` | JSONB | nullable | Generated result (text or image URL) |
+| `status` | ENUM | DEFAULT 'pending' | `pending`, `processing`, `completed`, `failed` |
+| `ai_model` | VARCHAR(50) | nullable | `gpt-4o-mini`, `dall-e-3`, `removebg` |
+| `tokens_used` | INTEGER | nullable | For billing/tracking |
+| `cost_cents` | INTEGER | nullable | Estimated cost in cents |
+
+### 4.2 Studio API Endpoints (`/api/v1/studio`)
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/generate/title` | JWT (seller) | Generate product title from image + category |
+| POST | `/generate/description` | JWT (seller) | Generate description from title + image + category |
+| POST | `/generate/caption` | JWT (seller) | Generate social media caption with hashtags |
+| POST | `/generate/image` | JWT (seller) | Generate product image from text prompt |
+| POST | `/background-remove` | JWT (seller) | Remove background from uploaded image |
+| POST | `/enhance` | JWT (seller) | Full product enhancement (title + description + caption in one call) |
+| GET | `/generations` | JWT (seller) | List past generations (paginated) |
+| GET | `/generations/{id}` | JWT (seller) | Get generation result |
+| GET | `/usage` | JWT (seller) | Current month usage vs tier limits |
+
+### 4.3 Studio Service Logic
+
+```
+StudioService
+  ├── generate_title(image, category, keywords)
+  │     → Analyze image → GPT-4o-mini → Return 3 title options
+  │
+  ├── generate_description(title, image, category, tone)
+  │     → Context-aware prompt → GPT-4o-mini → SEO-optimized description
+  │
+  ├── generate_caption(product_name, platform, tone)
+  │     → Platform-specific prompt (IG vs X vs TikTok) → caption + hashtags
+  │
+  ├── generate_image(text_prompt, style, product_context)
+  │     → DALL·E 3 → Image bytes → Upload to S3/R2 → Return URL
+  │
+  ├── remove_background(image_url)
+  │     → Remove.bg API → Processed image → Upload to S3/R2 → Return URL
+  │
+  └── enhance_product(product_id)
+        → Parallel: generate title + description + caption → Return all
+```
+
+### 4.4 Usage Limits (Per Subscription)
+
+| Feature | Free | Pro ($9/mo) | Business ($29/mo) |
+|---------|------|-------------|-------------------|
+| Caption generations | 10/month | Unlimited | Unlimited |
+| Description generations | 10/month | Unlimited | Unlimited |
+| Title generations | 10/month | Unlimited | Unlimited |
+| Image generations | 5/month | 30/month | Unlimited |
+| Background removal | 5/month | 50/month | Unlimited |
+| Full product enhance | 3/month | 20/month | Unlimited |
+
+### 4.5 Prompt Templates (`studio/prompts.py`)
+
+Centralized, versioned prompt templates with:
+- **Prompt injection sanitization**: Strip system prompt overrides from user inputs
+- **Platform-specific formatting**: Instagram (max 2200 chars, 30 hashtags), X (280 chars), TikTok (150 chars)
+- **Tone options**: Professional, casual, luxury, playful, minimal
+- **Category context**: Fashion, beauty, electronics, food — tailored vocabulary
+
+---
+
+## 5. Database Schema (Full)
+
+> All tables inherit `BaseModel`: `id` (UUID PK), `created_at`, `updated_at`, `deleted_at`, `version`.
+
+### 5.1 `users`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| `email` | VARCHAR(255) | UNIQUE, NOT NULL | |
+| `phone` | VARCHAR(20) | UNIQUE, nullable | |
+| `hashed_password` | VARCHAR(255) | nullable | Shadow accounts have no password |
+| `role` | ENUM('seller', 'buyer', 'admin') | NOT NULL | |
+| `is_verified` | BOOLEAN | DEFAULT false | |
+| `is_active` | BOOLEAN | DEFAULT true | |
+| `mfa_secret` | VARCHAR(255) | nullable, encrypted | TOTP secret |
+| `mfa_enabled` | BOOLEAN | DEFAULT false | |
+| `last_login_at` | TIMESTAMP | nullable | |
+| `is_shadow` | BOOLEAN | DEFAULT false | Created via checkout |
+
+### 5.2 `seller_profiles`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| `user_id` | UUID | FK → users, UNIQUE | |
+| `store_name` | VARCHAR(100) | NOT NULL | |
+| `slug` | VARCHAR(50) | UNIQUE, NOT NULL | @storename |
+| `logo_url` | VARCHAR(500) | nullable | |
+| `banner_url` | VARCHAR(500) | nullable | |
+| `bio` | TEXT | nullable | |
+| `category` | ENUM | | fashion, beauty, electronics, food, other |
+| `kyc_status` | ENUM | DEFAULT 'none' | none, phone_verified, id_submitted, verified |
+| `payout_account_id` | VARCHAR(255) | nullable | |
+| `payout_hold_days` | INTEGER | DEFAULT 7 | |
+| `total_orders` | INTEGER | DEFAULT 0 | Denormalized |
+| `average_rating` | DECIMAL(2,1) | DEFAULT 0.0 | |
+| `subscription_tier` | ENUM | DEFAULT 'free' | free, pro, business |
+
+### 5.3 `products`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| `seller_id` | UUID | FK → seller_profiles | |
+| `name` | VARCHAR(200) | NOT NULL | |
+| `slug` | VARCHAR(50) | UNIQUE | nanoid-based |
+| `description` | TEXT | nullable | Can be AI-generated via Studio |
+| `price` | DECIMAL(12,2) | NOT NULL | |
+| `compare_at_price` | DECIMAL(12,2) | nullable | Strikethrough price |
+| `currency` | VARCHAR(3) | NOT NULL | |
+| `stock_count` | INTEGER | CHECK ≥ 0 | |
+| `low_stock_threshold` | INTEGER | DEFAULT 3 | |
+| `status` | ENUM | DEFAULT 'draft' | draft, active, paused, sold_out, archived |
+| `category` | VARCHAR(100) | nullable | |
+| `is_pinned` | BOOLEAN | DEFAULT false | |
+| `scheduled_at` | TIMESTAMP | nullable | |
+| `metadata` | JSONB | nullable | |
+
+### 5.4 `product_images`
+
+| Column | Type | Constraints |
+|--------|------|------------|
+| `product_id` | UUID | FK → products |
+| `url` | VARCHAR(500) | NOT NULL |
+| `alt_text` | VARCHAR(255) | nullable |
+| `position` | INTEGER | NOT NULL (0 = hero) |
+| `is_bg_removed` | BOOLEAN | DEFAULT false |
+| `is_ai_generated` | BOOLEAN | DEFAULT false |
+
+### 5.5 `product_variants`
+
+| Column | Type | Constraints |
+|--------|------|------------|
+| `product_id` | UUID | FK → products |
+| `variant_type` | VARCHAR(50) | NOT NULL |
+| `variant_value` | VARCHAR(100) | NOT NULL |
+| `stock_count` | INTEGER | CHECK ≥ 0 |
+| `price_override` | DECIMAL(12,2) | nullable |
+| `sku` | VARCHAR(100) | nullable |
+
+### 5.6 `orders`
+
+| Column | Type | Constraints |
+|--------|------|------------|
+| `order_number` | VARCHAR(20) | UNIQUE |
+| `buyer_id` | UUID | FK → users |
+| `seller_id` | UUID | FK → seller_profiles |
+| `status` | ENUM | pending, paid, packed, shipped, delivered, cancelled, refunded |
+| `subtotal` | DECIMAL(12,2) | NOT NULL |
+| `platform_fee` | DECIMAL(12,2) | NOT NULL |
+| `total_amount` | DECIMAL(12,2) | NOT NULL |
+| `currency` | VARCHAR(3) | NOT NULL |
+| `shipping_address` | TEXT | AES-256 encrypted JSON |
+| `buyer_email` | VARCHAR(255) | NOT NULL |
+| `buyer_phone` | VARCHAR(20) | nullable |
+| `tracking_number` | VARCHAR(100) | nullable |
+| `delivery_notes` | TEXT | nullable |
+| `payment_ref` | VARCHAR(255) | nullable |
+| `payout_eligible_at` | TIMESTAMP | nullable |
+| `paid_at` / `shipped_at` / `delivered_at` | TIMESTAMP | nullable |
+
+### 5.7 `order_items`
+
+| Column | Type |
+|--------|------|
+| `order_id` | UUID FK → orders |
+| `product_id` | UUID FK → products |
+| `variant_id` | UUID FK, nullable |
+| `quantity` | INTEGER CHECK > 0 |
+| `unit_price` | DECIMAL(12,2) |
+| `product_name` | VARCHAR(200) — snapshot |
+| `variant_info` | JSONB — snapshot |
+
+### 5.8 `payments`
+
+| Column | Type | Constraints |
+|--------|------|------------|
+| `order_id` | UUID | FK → orders, UNIQUE |
+| `gateway` | ENUM | stripe, paystack, flutterwave |
+| `gateway_ref` | VARCHAR(255) | UNIQUE — idempotency |
+| `gateway_session_id` | VARCHAR(255) | nullable |
+| `amount` | DECIMAL(12,2) | NOT NULL |
+| `currency` | VARCHAR(3) | |
+| `status` | ENUM | pending, success, failed, refunded |
+| `webhook_verified_at` | TIMESTAMP | nullable |
+| `webhook_payload` | JSONB | audit |
+
+### 5.9 `stock_locks`
+
+| Column | Type |
+|--------|------|
+| `product_id` | UUID FK |
+| `variant_id` | UUID FK, nullable |
+| `session_id` | VARCHAR(255) |
+| `quantity` | INTEGER DEFAULT 1 |
+| `locked_at` | TIMESTAMP |
+| `expires_at` | TIMESTAMP (locked_at + 10 min) |
+
+### 5.10 `notifications`
+
+| Column | Type |
+|--------|------|
+| `user_id` | UUID FK |
+| `type` | VARCHAR(50) |
+| `channel` | ENUM: push, sms, whatsapp, email |
+| `title` | VARCHAR(255) |
+| `payload` | JSONB |
+| `sent_at` / `delivered_at` / `failed_at` | TIMESTAMP nullable |
+| `retry_count` | INTEGER DEFAULT 0 |
+
+### 5.11 `reviews`
+
+| Column | Type |
+|--------|------|
+| `order_id` | UUID FK, UNIQUE |
+| `buyer_id` | UUID FK |
+| `seller_id` | UUID FK |
+| `product_id` | UUID FK |
+| `rating` | INTEGER CHECK 1–5 |
+| `comment` | TEXT nullable |
+| `is_visible` | BOOLEAN DEFAULT true |
+
+### 5.12 `analytics_events`
+
+| Column | Type |
+|--------|------|
+| `product_id` | UUID FK, nullable |
+| `seller_id` | UUID FK, nullable |
+| `event_type` | VARCHAR(50) |
+| `referrer` | VARCHAR(500) |
+| `device_type` | VARCHAR(20) |
+| `ip_hash` | VARCHAR(64) |
+| `session_id` | VARCHAR(255) |
+| `metadata` | JSONB |
+
+### 5.13 `addresses`
+
+| Column | Type |
+|--------|------|
+| `user_id` | UUID FK |
+| `full_name` | VARCHAR(255) encrypted |
+| `line_1` / `line_2` | VARCHAR(255) encrypted |
+| `city` / `state` / `postal_code` | VARCHAR |
+| `country` | VARCHAR(2) ISO |
+| `phone` | VARCHAR(20) encrypted |
+| `is_default` | BOOLEAN |
+
+### 5.14 `audit_logs`
+
+| Column | Type |
+|--------|------|
+| `user_id` | UUID FK, nullable |
+| `action` | VARCHAR(100) |
+| `resource_type` | VARCHAR(50) |
+| `resource_id` | UUID |
+| `details` | JSONB |
+| `ip_address` | VARCHAR(45) |
+
+### 5.15 `studio_generations` (see Section 4.1)
+
+### Key Indexes
+
+| Index | Columns | Type |
+|-------|---------|------|
+| `ix_products_slug` | products.slug | UNIQUE |
+| `ix_seller_slug` | seller_profiles.slug | UNIQUE |
+| `ix_orders_buyer` | orders.buyer_id, created_at | COMPOSITE |
+| `ix_orders_seller` | orders.seller_id, status | COMPOSITE |
+| `ix_analytics_product` | analytics_events.product_id, event_type | COMPOSITE |
+| `ix_payments_ref` | payments.gateway_ref | UNIQUE |
+| `ix_products_seller` | products.seller_id, status | COMPOSITE |
+| `ix_studio_seller` | studio_generations.seller_id, generation_type | COMPOSITE |
+
+---
+
+## 6. API Endpoints (Full)
+
+### 6.1 Auth — `/api/v1/auth`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/register` | Register (seller or buyer) |
+| POST | `/login` | Login → access + refresh tokens |
+| POST | `/refresh` | Rotate access token |
+| POST | `/logout` | Revoke refresh token |
+| POST | `/forgot-password` | Password reset email |
+| POST | `/reset-password` | Reset with token |
+| POST | `/verify-email` | Email verification |
+| POST | `/verify-phone` | Send phone OTP |
+| POST | `/verify-phone/confirm` | Confirm OTP |
+| POST | `/mfa/setup` | TOTP setup |
+| POST | `/mfa/verify` | Activate MFA |
+| POST | `/mfa/disable` | Disable MFA (requires TOTP) |
+| POST | `/google` | Google OAuth |
+
+### 6.2 Users — `/api/v1/users`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/me` | Current user profile |
+| PATCH | `/me` | Update profile |
+| PUT | `/me/password` | Change password |
+| DELETE | `/me` | Delete account (GDPR) |
+| GET | `/me/data-export` | Export data (GDPR) |
+| GET/POST/PATCH/DELETE | `/me/addresses/*` | Saved addresses CRUD |
+
+### 6.3 Sellers — `/api/v1/seller`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/profile` | Create seller profile |
+| GET/PATCH | `/profile` | Get/update store settings |
+| PUT | `/profile/payout` | Connect bank (requires MFA) |
+| POST | `/profile/kyc` | Submit KYC documents |
+| GET/POST | `/profile/subscription` | Billing & tier management |
+| POST/DELETE | `/team/{member_id}` | Team management (Phase 3) |
+
+### 6.4 Products — `/api/v1/products`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/` | Create product |
+| GET | `/` | List seller's products |
+| GET/PATCH/DELETE | `/{id}` | Product CRUD |
+| PATCH | `/{id}/status` | Change status |
+| PATCH | `/{id}/stock` | Update stock |
+| POST/DELETE | `/{id}/images/*` | Image management (max 5) |
+| POST/PATCH/DELETE | `/{id}/variants/*` | Variant management |
+| POST | `/bulk-upload` | CSV upload (Phase 3) |
+| GET | `/{id}/qr` | QR code for product link |
+
+### 6.5 Studio — `/api/v1/studio` ✨
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/generate/title` | Generate product titles |
+| POST | `/generate/description` | Generate product description |
+| POST | `/generate/caption` | Generate social caption + hashtags |
+| POST | `/generate/image` | Generate product image (DALL·E) |
+| POST | `/background-remove` | Remove image background |
+| POST | `/enhance` | Full product enhance (title + desc + caption) |
+| GET | `/generations` | Generation history |
+| GET | `/generations/{id}` | Get generation result |
+| GET | `/usage` | Monthly usage vs limits |
+
+### 6.6 Storefront (public) — `/api/v1/storefront`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/@{slug}` | Storefront page data |
+| GET | `/@{slug}/products` | Store products (paginated) |
+
+### 6.7 Flash Page (public) — `/api/v1/flash`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/{slug}` | Product data for Flash Page |
+| POST | `/{slug}/track` | Track click/view event |
+
+### 6.8 Checkout — `/api/v1/checkout`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/lock` | Lock 1 unit (10-min TTL) |
+| DELETE | `/lock/{id}` | Release lock |
+| POST | `/initiate` | Create order + payment session |
+| GET | `/session/{id}` | Checkout session status |
+
+### 6.9 Orders — `/api/v1/orders`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/seller` | Seller's orders (filtered) |
+| GET | `/seller/{id}` | Order detail |
+| PATCH | `/seller/{id}/status` | Update status |
+| POST | `/seller/{id}/tracking` | Add tracking number |
+| POST | `/seller/bulk-status` | Bulk status update |
+| GET | `/seller/export` | Export CSV |
+| GET | `/buyer` | Buyer's order history |
+| GET | `/buyer/{id}` | Buyer order detail |
+| POST | `/buyer/{id}/dispute` | Raise dispute |
+
+### 6.10 Payments — `/api/v1/payments`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/webhook/stripe` | Stripe webhook |
+| POST | `/webhook/paystack` | Paystack webhook |
+| POST | `/webhook/flutterwave` | Flutterwave webhook |
+| GET | `/seller/payouts` | Payout history |
+| POST | `/seller/payouts/request` | Manual payout request |
+| GET | `/seller/statements` | Monthly statements |
+
+### 6.11 Reviews — `/api/v1/reviews`
+
+POST `/`, GET `/product/{id}`, GET `/seller/{slug}`
+
+### 6.12 Analytics — `/api/v1/analytics`
+
+GET `/overview`, `/products`, `/traffic`, `/customers`, `/funnel`, `/revenue-chart`
+
+### 6.13 Notifications — `/api/v1/notifications`
+
+GET `/`, PATCH `/{id}/read`, GET/PUT `/preferences`
+
+### 6.14 CRM (Phase 3) — `/api/v1/crm`
+
+GET `/customers`, GET `/customers/{id}`, POST `/broadcast`
+
+---
+
+## 7. Cross-Module Communication Patterns
+
+Modules don't import each other's internals. Instead:
+
+```mermaid
+graph LR
+    A[Checkout Module] -->|"creates order via"| B[Orders Module]
+    A -->|"calls"| C[Stock Locker]
+    A -->|"calls via Protocol"| D[Payment Gateway]
+    D -->|"webhook triggers"| E[Payments Module]
+    E -->|"emits event"| F[Notifications Module]
+    E -->|"updates"| B
+    G[Studio Module] -->|"calls via Protocol"| H[AI Provider]
+    G -->|"calls via Protocol"| I[Storage Backend]
+    J[Products Module] -->|"calls via Protocol"| I
+```
+
+**Inter-module patterns:**
+1. **Direct service injection** — Module A injects Module B's service via `Depends()` (only for tightly coupled flows like checkout → order)
+2. **Events / Celery tasks** — Loose coupling for side effects (payment confirmed → send notification)
+3. **Shared Protocols** — Never depend on concrete implementations
+
+---
+
+## 8. Docker Compose (Development)
+
+```yaml
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    env_file: .env
+    depends_on: [postgres, redis]
+    volumes: ["./app:/app/app"]
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dashlink
+      POSTGRES_USER: dashlink
+      POSTGRES_PASSWORD: dashlink_dev
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  celery_worker:
+    build: .
+    env_file: .env
+    depends_on: [postgres, redis]
+    command: >
+      celery -A app.tasks.celery_app worker -l info
+      -Q default,notifications,media,ai,analytics,payments
+
+  celery_beat:
+    build: .
+    env_file: .env
+    depends_on: [postgres, redis]
+    command: celery -A app.tasks.celery_app beat -l info
+
+volumes:
+  pgdata:
+```
+
+---
+
+## 9. Phased Execution Roadmap
+
+### Phase 1: Foundation (Weeks 1–4) ← **START HERE**
+
+| Week | Focus | Deliverables |
+|------|-------|-------------|
+| **1** | Project Setup & Auth | FastAPI scaffold (module-based), Docker Compose, `core/` module (base model, base repo, security, protocols). Auth module: register, login, JWT, Argon2. Alembic migrations. pytest setup. |
+| **2** | Product Engine | Products module: CRUD, slug gen, image upload → S3/R2, Pillow pipeline, status machine, stock management. |
+| **3** | Checkout & Payment | Checkout module: stock locking (Redis + DB). Payments module: Stripe + Paystack gateways (test mode), webhook handlers, HMAC verification, idempotent processing. |
+| **4** | Orders & Notifications | Orders module: lifecycle, status machine, seller/buyer views. Notifications module: Resend email + Firebase push. Celery setup. |
+
+### Phase 2: MVP Launch (Weeks 5–8)
+
+| Week | Deliverables |
+|------|-------------|
+| **5** | Mobile API polish, FCM token registration, share link generation |
+| **6** | **Studio module**: title/description/caption generation (OpenAI), background removal (Remove.bg), image generation (DALL·E), usage tracking |
+| **7** | Buyer accounts: shadow accounts, progressive creation, saved addresses. Storefront module: `/@slug` public pages |
+| **8** | MFA (TOTP), WhatsApp notifications, production deploy, security audit, load testing |
+
+### Phase 3: Growth (Weeks 9–14)
+
+Analytics, CRM, product variants, discount codes, bulk CSV, team RBAC, reviews, KYC, disputes, fraud scoring.
+
+### Phase 4: Platform Maturity (Weeks 15–20)
+
+Subscription billing, advanced AI (smart pricing, predictive stock), public API, developer docs, Zapier connectors.
+
+---
+
+## 10. Verification Plan
+
+### Automated Tests
+```bash
+pytest tests/ -v --cov=app --cov-report=term-missing
+```
+
+Per-module test structure mirrors the module layout. Each module has:
+- **Unit tests**: Service logic (stock locking, fee calc, slug gen, usage limits)
+- **Integration tests**: API endpoints via `httpx.AsyncClient`
+- **Mock-based tests**: Gateway Protocols mocked for deterministic testing
+
+### Manual Verification
+- End-to-end checkout flow (Stripe/Paystack test mode)
+- Image upload + processing pipeline
+- Studio: generate title/description/caption, verify output quality
+- Webhook delivery via gateway CLI tools
+- Load test with `k6` before MVP launch
+
+---
+
+> [!IMPORTANT]
+> This plan uses **module-based vertical slice architecture** where each domain is self-contained. CAP trade-offs are explicitly chosen per subsystem (CP for payments/stock, AP for analytics/notifications). SOLID is enforced via Protocols and dependency injection. DRY is enforced via `BaseModel`, `BaseRepository`, and shared Protocols. The **AI Studio** is a first-class module enabling sellers to generate product images, titles, descriptions, and captions.
+>
+> Ready to execute **Phase 1, Week 1** on your approval.

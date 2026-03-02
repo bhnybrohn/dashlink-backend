@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PGPASSWORD=root psql:*)",
+      "Read(//opt/homebrew/opt/**)",
+      "Bash(PGPASSWORD=root /opt/homebrew/opt/postgresql@15/bin/psql:*)",
+      "Bash(python3:*)"
+    ],
+    "additionalDirectories": [
+      "/Users/tolusmith/Documents/dashlink/backend/app"
+    ]
+  }
+}

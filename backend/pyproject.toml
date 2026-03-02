@@ -1,0 +1,97 @@
+[project]
+name = "dashlink-backend"
+version = "0.1.0"
+description = "DashLink — Social Commerce Backend"
+requires-python = ">=3.12"
+dependencies = [
+    # Web framework
+    "fastapi[standard]>=0.115.0",
+    "granian>=1.6.0",
+
+    # Database
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+
+    # Redis
+    "redis[hiredis]>=5.2.0",
+
+    # Task queue
+    "celery[redis]>=5.4.0",
+
+    # Auth & Security
+    "argon2-cffi>=23.1.0",
+    "python-jose[cryptography]>=3.3.0",
+    "pyotp>=2.9.0",
+    "qrcode>=8.0",
+    "cryptography>=44.0.0",
+
+    # Validation & Settings
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "email-validator>=2.2.0",
+
+    # Slug generation
+    "nanoid>=2.0.0",
+
+    # Image processing
+    "Pillow>=11.0.0",
+
+    # HTTP client (for external APIs)
+    "httpx>=0.28.0",
+
+    # Storage (S3/R2)
+    "boto3>=1.35.0",
+
+    # AI
+    "openai>=1.58.0",
+
+    # Notifications
+    "twilio>=9.4.0",
+    "resend>=2.7.0",
+    "firebase-admin>=6.6.0",
+
+    # Payment gateways
+    "stripe>=11.4.0",
+
+    # Utilities
+    "python-multipart>=0.0.18",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "httpx>=0.28.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "factory-boy>=3.3.0",
+    "fakeredis>=2.25.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
