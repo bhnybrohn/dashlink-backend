@@ -18,8 +18,10 @@ from app.auth.schemas import (
     OAuthAccountResponse,
     OAuthLinkRequest,
     OAuthRequest,
+    PasswordlessAuthResponse,
     PasswordlessLoginRequest,
     PasswordlessRegisterRequest,
+    PasswordlessStartRequest,
     PasswordlessVerifyRequest,
     RefreshRequest,
     RegisterRequest,
@@ -186,6 +188,48 @@ async def passwordless_login_verify(
 
     ip = request.client.host if request.client else "unknown"
     return await service.passwordless_login_verify(
+        email=body.email,
+        code=body.code,
+        redis=redis,
+        ip_address=ip,
+    )
+
+
+# ── Unified Passwordless ──
+
+
+@router.post("/passwordless/start", response_model=CodeSentResponse)
+async def passwordless_start(
+    body: PasswordlessStartRequest,
+    request: Request,
+    service: AuthService = Depends(_get_service),
+    redis: Redis = Depends(get_redis),  # type: ignore[type-arg]
+):
+    """Unified passwordless flow — auto-registers or logs in based on email existence."""
+    key = auth_rate_limiter.get_key(request, prefix="rl:passwordless_start")
+    await auth_rate_limiter.check(redis, key)
+
+    return await service.passwordless_start(
+        email=body.email,
+        role=body.role,
+        phone=body.phone,
+        redis=redis,
+    )
+
+
+@router.post("/passwordless/verify", response_model=PasswordlessAuthResponse)
+async def passwordless_verify(
+    body: PasswordlessVerifyRequest,
+    request: Request,
+    service: AuthService = Depends(_get_service),
+    redis: Redis = Depends(get_redis),  # type: ignore[type-arg]
+):
+    """Verify passwordless code — returns tokens + is_new_user + onboarding status."""
+    key = auth_rate_limiter.get_key(request, prefix="rl:passwordless_verify")
+    await auth_rate_limiter.check(redis, key)
+
+    ip = request.client.host if request.client else "unknown"
+    return await service.passwordless_verify(
         email=body.email,
         code=body.code,
         redis=redis,

@@ -126,7 +126,35 @@ class CodeSentResponse(BaseModel):
 
     message: str
     expires_in: int  # seconds until the code expires
+    is_new_user: bool | None = None  # set by unified /start endpoint
     code: str | None = None  # included only in non-production environments
+
+
+# ── Unified Passwordless ──
+
+
+class PasswordlessStartRequest(BaseModel):
+    """Unified passwordless start — registers or logs in based on email existence."""
+
+    email: EmailStr
+    role: str = Field(default="seller", pattern="^(seller|buyer)$")  # only used for new users
+    phone: str | None = Field(None, max_length=20)
+
+
+class OnboardingSnapshot(BaseModel):
+    """Lightweight onboarding status for auth responses."""
+
+    current_step: int  # 0 = all done
+    is_complete: bool
+
+
+class PasswordlessAuthResponse(BaseModel):
+    """Unified passwordless verify response — tokens + navigation hints."""
+
+    user: AuthUserResponse
+    tokens: TokenResponse
+    is_new_user: bool
+    onboarding: OnboardingSnapshot | None = None  # None for buyers
 
 
 # ── OAuth ──
