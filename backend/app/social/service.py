@@ -17,8 +17,9 @@ from app.social.publishers.instagram import InstagramPublisher
 from app.social.publishers.pinterest import PinterestPublisher
 from app.social.publishers.tiktok import TikTokPublisher
 from app.social.publishers.twitter import TwitterPublisher
+from app.products.repository import ProductRepository
 from app.social.repository import SocialAccountRepository, SocialPostRepository
-from app.social.schemas import SocialConnectRequest, SocialPostCreate
+from app.social.schemas import ProductPostCreate, SocialConnectRequest, SocialPostCreate
 
 
 class SocialService:
@@ -26,6 +27,7 @@ class SocialService:
         self.session = session
         self.account_repo = SocialAccountRepository(session)
         self.post_repo = SocialPostRepository(session)
+        self.product_repo = ProductRepository(session)
 
     # ── OAuth URL Generation ──
 
@@ -315,7 +317,74 @@ class SocialService:
 
         return await self.post_repo.get_or_404(post.id)
 
-    async def publish_post(self, post_id: str) -> SocialPost:
+    @staticmethod
+    def _build_product_caption(
+        product, seller_slug: str, include_link: bool = True,
+    ) -> str:
+        """Auto-generate a social caption from product data."""
+        lines = [product.name]
+        lines.append(f"{product.currency} {product.price:,.0f}")
+        if product.description:
+            lines.append("")
+            lines.append(product.description[:300])
+        if include_link:
+            lines.append("")
+            lines.append(f"Shop now → https://dashlink.to/{seller_slug}/{product.slug}")
+        return "\n".join(lines)
+
+    async def create_product_post(
+        self, seller_id: str, seller_slug: str, data: ProductPostCreate,
+    ) -> SocialPost:
+        """Post a product directly — auto-resolves image and caption from product data."""
+        # Validate social account
+        account = await self.account_repo.get(data.social_account_id)
+        if not account or account.seller_id != seller_id:
+            raise BadRequestError(detail="Social account not found or not owned by you")
+        if account.deleted_at is not None:
+            raise BadRequestError(detail="Social account has been disconnected")
+
+        # Fetch product with images
+        product = await self.product_repo.get_with_relations(data.product_id)
+        if not product or product.seller_id != seller_id:
+            raise BadRequestError(detail="Product not found or not owned by you")
+        if product.status != "active":
+            raise BadRequestError(detail="Only active products can be posted")
+        if not product.images:
+            raise BadRequestError(detail="Product has no images. Add at least one image before posting.")
+
+        # Auto-resolve image and caption
+        image_url = product.images[0].url
+        caption = data.caption or self._build_product_caption(
+            product, seller_slug, include_link=data.include_link,
+        )
+
+        # Build product link for link posts
+        link_url = f"https://dashlink.to/{seller_slug}/{product.slug}" if data.post_type == "link" else None
+
+        status = "scheduled" if data.scheduled_at else "pending"
+
+        post = await self.post_repo.create(
+            seller_id=seller_id,
+            social_account_id=account.id,
+            product_id=product.id,
+            platform=account.platform,
+            post_type=data.post_type,
+            caption=caption,
+            image_url=image_url,
+            link_url=link_url,
+            status=status,
+            scheduled_at=data.scheduled_at,
+        )
+        await self.session.commit()
+
+        if status == "pending":
+            # For Instagram with multiple images, store all URLs for carousel
+            all_image_urls = [img.url for img in product.images]
+            await self.publish_post(post.id, product_image_urls=all_image_urls)
+
+        return await self.post_repo.get_or_404(post.id)
+
+    async def publish_post(self, post_id: str, *, product_image_urls: list[str] | None = None) -> SocialPost:
         """Actually publish a post to the platform API."""
         post = await self.post_repo.get_or_404(post_id)
         account = await self.account_repo.get_or_404(post.social_account_id)
@@ -325,7 +394,7 @@ class SocialService:
 
         try:
             if post.platform == "instagram":
-                result = await self._publish_instagram(account, post)
+                result = await self._publish_instagram(account, post, image_urls=product_image_urls)
             elif post.platform == "tiktok":
                 result = await self._publish_tiktok(account, post)
             elif post.platform == "facebook":
@@ -356,8 +425,9 @@ class SocialService:
 
     async def _publish_instagram(
         self, account: SocialAccount, post: SocialPost,
+        *, image_urls: list[str] | None = None,
     ) -> dict:
-        """Publish a photo to Instagram."""
+        """Publish to Instagram — carousel if multiple images, single photo otherwise."""
         metadata = account.account_metadata or {}
         ig_user_id = metadata.get("ig_user_id", account.platform_user_id)
         page_token_enc = metadata.get("page_access_token_encrypted")
@@ -366,8 +436,17 @@ class SocialService:
             raise BadRequestError(detail="Instagram page access token not found")
 
         page_access_token = decrypt_value(page_token_enc)
-
         publisher = InstagramPublisher()
+
+        # Use carousel for multiple product images
+        if image_urls and len(image_urls) > 1:
+            return await publisher.publish_carousel(
+                ig_user_id=ig_user_id,
+                page_access_token=page_access_token,
+                image_urls=image_urls,
+                caption=post.caption,
+            )
+
         return await publisher.publish_photo(
             ig_user_id=ig_user_id,
             page_access_token=page_access_token,

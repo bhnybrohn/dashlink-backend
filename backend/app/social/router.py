@@ -9,6 +9,7 @@ from app.auth.dependencies import get_current_seller, get_onboarded_seller
 from app.core.base_schemas import SuccessResponse
 from app.database import get_db
 from app.social.schemas import (
+    ProductPostCreate,
     SocialAccountListResponse,
     SocialAccountResponse,
     SocialConnectRequest,
@@ -155,6 +156,26 @@ async def create_post(
     by a background worker. Otherwise it's published immediately.
     """
     return await service.create_post(current_user.id, body)
+
+
+@router.post("/post/product", response_model=SocialPostResponse, status_code=201)
+async def create_product_post(
+    body: ProductPostCreate,
+    current_user: User = Depends(get_onboarded_seller),
+    service: SocialService = Depends(_get_service),
+):
+    """Post a product directly — image and caption auto-resolved from product data.
+
+    Just provide `product_id` and `social_account_id`. The system pulls the
+    product's images and generates a caption from product name, price, and description.
+    For Instagram, products with multiple images are posted as carousels.
+    """
+    seller_profile = current_user.seller_profile
+    return await service.create_product_post(
+        seller_id=seller_profile.id,
+        seller_slug=seller_profile.slug,
+        data=body,
+    )
 
 
 @router.get("/posts", response_model=SocialPostListResponse)

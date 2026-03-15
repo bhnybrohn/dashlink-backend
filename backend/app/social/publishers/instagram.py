@@ -166,3 +166,76 @@ class InstagramPublisher:
                 permalink = permalink_resp.json().get("permalink")
 
             return {"id": post_id, "permalink": permalink}
+
+    async def publish_carousel(
+        self,
+        *,
+        ig_user_id: str,
+        page_access_token: str,
+        image_urls: list[str],
+        caption: str,
+    ) -> dict:
+        """Publish a carousel (multi-image) post to Instagram.
+
+        1. Create a child container for each image (is_carousel_item=true)
+        2. Create a carousel container referencing all children
+        3. Publish the carousel
+
+        Returns: {"id": platform_post_id, "permalink": url}
+        """
+        async with httpx.AsyncClient(timeout=90) as client:
+            # Step 1: Create child containers (max 10 per Instagram API)
+            child_ids = []
+            for url in image_urls[:10]:
+                child_resp = await client.post(
+                    f"{GRAPH_API_BASE}/{ig_user_id}/media",
+                    data={
+                        "image_url": url,
+                        "is_carousel_item": "true",
+                        "access_token": page_access_token,
+                    },
+                )
+                child_resp.raise_for_status()
+                child_ids.append(child_resp.json()["id"])
+
+            await asyncio.sleep(2)
+
+            # Step 2: Create carousel container
+            carousel_resp = await client.post(
+                f"{GRAPH_API_BASE}/{ig_user_id}/media",
+                data={
+                    "media_type": "CAROUSEL",
+                    "caption": caption,
+                    "children": ",".join(child_ids),
+                    "access_token": page_access_token,
+                },
+            )
+            carousel_resp.raise_for_status()
+            creation_id = carousel_resp.json()["id"]
+
+            await asyncio.sleep(2)
+
+            # Step 3: Publish
+            publish_resp = await client.post(
+                f"{GRAPH_API_BASE}/{ig_user_id}/media_publish",
+                data={
+                    "creation_id": creation_id,
+                    "access_token": page_access_token,
+                },
+            )
+            publish_resp.raise_for_status()
+            post_id = publish_resp.json()["id"]
+
+            # Get permalink
+            permalink_resp = await client.get(
+                f"{GRAPH_API_BASE}/{post_id}",
+                params={
+                    "fields": "permalink",
+                    "access_token": page_access_token,
+                },
+            )
+            permalink = None
+            if permalink_resp.status_code == 200:
+                permalink = permalink_resp.json().get("permalink")
+
+            return {"id": post_id, "permalink": permalink}

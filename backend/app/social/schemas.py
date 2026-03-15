@@ -38,6 +38,17 @@ class SocialPostCreate(BaseModel):
         return self
 
 
+class ProductPostCreate(BaseModel):
+    """Post a product directly — image and caption auto-resolved from product data."""
+
+    product_id: str
+    social_account_id: str
+    caption: str | None = Field(None, max_length=2200)
+    post_type: str = Field(default="photo", pattern="^(photo|link)$")
+    scheduled_at: datetime | None = None
+    include_link: bool = True
+
+
 # ── Responses ──
 
 
